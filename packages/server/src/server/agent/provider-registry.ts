@@ -30,6 +30,7 @@ import { GenericACPAgentClient } from "./providers/generic-acp-agent.js";
 import { OpenCodeAgentClient } from "./providers/opencode-agent.js";
 import { OpenCodeServerManager } from "./providers/opencode/server-manager.js";
 import { PiRpcAgentClient } from "./providers/pi/agent.js";
+import { OmpRpcAgentClient } from "./providers/omp/agent.js";
 import { MockLoadTestAgentClient } from "./providers/mock-load-test-agent.js";
 import {
   AGENT_PROVIDER_DEFINITIONS,
@@ -122,6 +123,11 @@ const PROVIDER_CLIENT_FACTORIES: Record<string, ProviderClientFactory> = {
   opencode: (logger, runtimeSettings) => new OpenCodeAgentClient(logger, runtimeSettings),
   pi: (logger, runtimeSettings) =>
     new PiRpcAgentClient({
+      logger,
+      runtimeSettings,
+    }),
+  omp: (logger, runtimeSettings) =>
+    new OmpRpcAgentClient({
       logger,
       runtimeSettings,
     }),
