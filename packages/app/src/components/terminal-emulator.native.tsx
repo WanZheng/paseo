@@ -8,7 +8,14 @@ import {
   type ComponentProps,
   type Ref,
 } from "react";
-import { StyleSheet, View, type StyleProp, type ViewStyle } from "react-native";
+import {
+  Keyboard,
+  StyleSheet,
+  View,
+  type GestureResponderEvent,
+  type StyleProp,
+  type ViewStyle,
+} from "react-native";
 import { WebView, type WebViewMessageEvent } from "react-native-webview";
 import type { ITheme } from "@xterm/xterm";
 import type { TerminalState } from "@server/shared/messages";
@@ -28,6 +35,7 @@ export interface TerminalEmulatorHandle {
   restoreOutput: (data: TerminalOutputData) => void;
   renderSnapshot: (state: TerminalState | null) => void;
   clear: () => void;
+  blur: () => void;
 }
 
 interface TerminalEmulatorProps {
@@ -80,7 +88,7 @@ type BridgeInboundMessage =
   | { type: "restoreOutput"; streamKey: string; text: string }
   | { type: "renderSnapshot"; streamKey: string; state: TerminalState | null }
   | { type: "clear"; streamKey: string }
-  | { type: "focus"; streamKey: string }
+  | { type: "focus"; streamKey: string; forceRefocus?: boolean }
   | { type: "resize"; streamKey: string }
   | { type: "setTheme"; streamKey: string; theme: ITheme }
   | { type: "setScrollback"; streamKey: string; lines: number }
@@ -130,7 +138,13 @@ const TERMINAL_WEBVIEW_SOURCE = { html: terminalEmulatorWebViewHtml };
 const TERMINAL_WEBVIEW_ORIGIN_WHITELIST = ["*"];
 const BRIDGE_READY_TIMEOUT_MS = 2_500;
 const RENDERER_READY_TIMEOUT_MS = 2_500;
+const TERMINAL_TAP_MOVE_TOLERANCE_PX = 8;
 type WebViewProps = ComponentProps<typeof WebView>;
+interface PendingTerminalTap {
+  startX: number;
+  startY: number;
+  moved: boolean;
+}
 
 function buildThemeKey(theme: ITheme): string {
   return JSON.stringify(theme);
@@ -196,6 +210,7 @@ export default function TerminalEmulator({
   const mountedStreamKeyRef = useRef<string | null>(null);
   const bridgeReadyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const rendererReadyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingTapRef = useRef<PendingTerminalTap | null>(null);
   const mountConfigRef = useRef({
     streamKey,
     initialSnapshot,
@@ -333,6 +348,12 @@ export default function TerminalEmulator({
       clear: () => {
         outputDecoderRef.current.decode();
         sendToWebView({ type: "clear", streamKey });
+      },
+      blur: () => {
+        webViewRef.current?.injectJavaScript(
+          "window.__PASEO_TERMINAL_WEBVIEW_BLUR__ && window.__PASEO_TERMINAL_WEBVIEW_BLUR__(); true;",
+        );
+        Keyboard.dismiss();
       },
     }),
     [sendToWebView, streamKey],
@@ -543,19 +564,63 @@ export default function TerminalEmulator({
     resetWebViewDocument();
   }, [resetWebViewDocument]);
 
+  const handleWebViewTouchStart = useCallback((event: GestureResponderEvent) => {
+    pendingTapRef.current = {
+      startX: event.nativeEvent.pageX,
+      startY: event.nativeEvent.pageY,
+      moved: false,
+    };
+  }, []);
+
+  const handleWebViewTouchMove = useCallback((event: GestureResponderEvent) => {
+    const pendingTap = pendingTapRef.current;
+    if (!pendingTap) return;
+    const dx = event.nativeEvent.pageX - pendingTap.startX;
+    const dy = event.nativeEvent.pageY - pendingTap.startY;
+    if (
+      Math.abs(dx) > TERMINAL_TAP_MOVE_TOLERANCE_PX ||
+      Math.abs(dy) > TERMINAL_TAP_MOVE_TOLERANCE_PX
+    ) {
+      pendingTap.moved = true;
+    }
+  }, []);
+
+  const handleWebViewTouchEnd = useCallback(() => {
+    const pendingTap = pendingTapRef.current;
+    pendingTapRef.current = null;
+    if (!pendingTap || pendingTap.moved) {
+      return;
+    }
+    webViewRef.current?.requestFocus();
+    sendToWebView({ type: "focus", streamKey, forceRefocus: true });
+  }, [sendToWebView, streamKey]);
+
+  const handleWebViewTouchCancel = useCallback(() => {
+    pendingTapRef.current = null;
+  }, []);
+
+  const backgroundColor = xtermTheme.background ?? "#0b0b0b";
+  const rootStyle = useMemo<StyleProp<ViewStyle>>(
+    () => [styles.root, { backgroundColor }],
+    [backgroundColor],
+  );
   const webViewStyle = useMemo<StyleProp<ViewStyle>>(
-    () => [styles.webView, { backgroundColor: xtermTheme.background ?? "#0b0b0b" }],
-    [xtermTheme.background],
+    () => [styles.webView, { backgroundColor }],
+    [backgroundColor],
+  );
+  const webViewContainerStyle = useMemo<StyleProp<ViewStyle>>(
+    () => [styles.webViewContainer, { backgroundColor }],
+    [backgroundColor],
   );
 
   return (
-    <View style={styles.root} testID={testId}>
+    <View style={rootStyle} testID={testId}>
       <WebView
         key={webViewEpoch}
         ref={webViewRef}
         source={TERMINAL_WEBVIEW_SOURCE}
         style={webViewStyle}
-        containerStyle={styles.webViewContainer}
+        containerStyle={webViewContainerStyle}
         originWhitelist={TERMINAL_WEBVIEW_ORIGIN_WHITELIST}
         scrollEnabled
         nestedScrollEnabled
@@ -564,12 +629,16 @@ export default function TerminalEmulator({
         keyboardDisplayRequiresUserAction={false}
         automaticallyAdjustContentInsets={false}
         contentInsetAdjustmentBehavior="never"
-        textInteractionEnabled={false}
+        textInteractionEnabled
         allowsLinkPreview={false}
         setSupportMultipleWindows={false}
         setBuiltInZoomControls={false}
         setDisplayZoomControls={false}
         textZoom={100}
+        onTouchStart={handleWebViewTouchStart}
+        onTouchMove={handleWebViewTouchMove}
+        onTouchEnd={handleWebViewTouchEnd}
+        onTouchCancel={handleWebViewTouchCancel}
         onMessage={handleMessage}
         onLoadStart={handleLoadStart}
         onContentProcessDidTerminate={handleContentProcessDidTerminate}
@@ -585,14 +654,11 @@ const styles = StyleSheet.create({
     minHeight: 0,
     minWidth: 0,
     overflow: "hidden",
-    backgroundColor: "#0b0b0b",
   },
   webView: {
     flex: 1,
-    backgroundColor: "#0b0b0b",
   },
   webViewContainer: {
     flex: 1,
-    backgroundColor: "#0b0b0b",
   },
 });
