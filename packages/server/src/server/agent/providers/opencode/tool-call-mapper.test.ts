@@ -182,6 +182,36 @@ describe("opencode tool-call mapper", () => {
     }
   });
 
+  it("unwraps OpenCode XML read output into file content", () => {
+    const item = expectMapped(
+      mapOpencodeToolCall({
+        toolName: "read",
+        callId: "opencode-read-xml",
+        status: "completed",
+        input: { filePath: "/Users/moboudra/dev/paseo/docs/release.md" },
+        output: [
+          "<path>/Users/moboudra/dev/paseo/docs/release.md</path>",
+          "<type>file</type>",
+          "<content>",
+          "1: # Release",
+          "2:",
+          "3: All workspaces share one version and release together.",
+          "</content>",
+        ].join("\n"),
+      }),
+    );
+
+    expect(item.detail).toEqual({
+      type: "read",
+      filePath: "/Users/moboudra/dev/paseo/docs/release.md",
+      content: [
+        "1: # Release",
+        "2:",
+        "3: All workspaces share one version and release together.",
+      ].join("\n"),
+    });
+  });
+
   it("maps failed calls with required error", () => {
     const item = expectMapped(
       mapOpencodeToolCall({
@@ -242,6 +272,27 @@ describe("opencode tool-call mapper", () => {
       type: "search",
       query: "opencode mapper",
       toolName: "web_search",
+    });
+  });
+
+  it("maps completed write calls with OpenCode success text into canonical detail", () => {
+    const item = expectMapped(
+      mapOpencodeToolCall({
+        toolName: "write",
+        callId: "opencode-write-success-text",
+        status: "completed",
+        input: {
+          filePath: "/Users/moboudra/.paseo/worktrees/1luy0po7/cold-ladybug/dummy.txt",
+          content: "hello world\n",
+        },
+        output: "Wrote file successfully.",
+      }),
+    );
+
+    expect(item.detail).toEqual({
+      type: "write",
+      filePath: "/Users/moboudra/.paseo/worktrees/1luy0po7/cold-ladybug/dummy.txt",
+      content: "hello world\n",
     });
   });
 

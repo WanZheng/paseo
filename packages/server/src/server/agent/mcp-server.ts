@@ -10,7 +10,7 @@ import type {
 } from "@modelcontextprotocol/sdk/types.js";
 
 import type { AgentProvider } from "./agent-sdk-types.js";
-import type { AgentManager, WaitForAgentResult } from "./agent-manager.js";
+import type { AgentManager, ManagedAgent, WaitForAgentResult } from "./agent-manager.js";
 import {
   AgentFeatureSchema,
   AgentPermissionRequestPayloadSchema,
@@ -75,7 +75,11 @@ import {
   toScheduleSummary,
   waitForAgentWithTimeout,
 } from "./mcp-shared.js";
-import { sendPromptToAgent, setupFinishNotification, startAgentRun } from "./agent-prompt.js";
+import {
+  sendPromptToAgent,
+  setupFinishNotification,
+  startCreatedAgentInitialPrompt,
+} from "./agent-prompt.js";
 import type { GitHubService } from "../../services/github-service.js";
 import type { WorkspaceGitService } from "../workspace-git-service.js";
 import type { CreatePaseoWorktreeInput } from "../paseo-worktree-service.js";
@@ -129,6 +133,42 @@ const CODEX_TO_CLAUDE_MODE: Record<string, string> = {
   auto: "default",
   "full-access": "bypassPermissions",
 };
+
+const OPENCODE_PROVIDER_ID = "opencode";
+const OPENCODE_BUILD_MODE_ID = "build";
+const OPENCODE_LEGACY_FULL_ACCESS_MODE_ID = "full-access";
+const OPENCODE_AUTO_ACCEPT_FEATURE_ID = "auto_accept";
+
+function isOpenCodeLegacyFullAccessMode(
+  provider: AgentProvider,
+  modeId: string | undefined,
+): boolean {
+  return provider === OPENCODE_PROVIDER_ID && modeId === OPENCODE_LEGACY_FULL_ACCESS_MODE_ID;
+}
+
+function withOpenCodeAutoAcceptFeature(
+  features: Record<string, unknown> | undefined,
+  enabled: boolean,
+): Record<string, unknown> {
+  return {
+    ...features,
+    [OPENCODE_AUTO_ACCEPT_FEATURE_ID]: enabled,
+  };
+}
+
+function hasOpenCodeAutoAcceptFeature(agent: ManagedAgent): boolean {
+  if (agent.provider !== OPENCODE_PROVIDER_ID) {
+    return false;
+  }
+  return (
+    agent.features?.some(
+      (feature) =>
+        feature.id === OPENCODE_AUTO_ACCEPT_FEATURE_ID &&
+        feature.type === "toggle" &&
+        feature.value === true,
+    ) === true || agent.config.featureValues?.[OPENCODE_AUTO_ACCEPT_FEATURE_ID] === true
+  );
+}
 
 function mapModeAcrossProviders(
   sourceMode: string,
@@ -204,6 +244,37 @@ function formatStructuredContentForModel(structuredContent: unknown): string {
 
   const json = JSON.stringify(structuredContent, null, 2);
   return summary.length > 0 ? `${summary.join("\n")}\n\n${json}` : json;
+}
+
+function isZodSchema(value: unknown): value is z.ZodTypeAny {
+  return (
+    typeof value === "object" && value !== null && "_def" in value && "safeParseAsync" in value
+  );
+}
+
+function relaxMcpOutputSchema(outputSchema: unknown): unknown {
+  if (!outputSchema) {
+    return outputSchema;
+  }
+
+  if (isZodSchema(outputSchema)) {
+    return outputSchema instanceof z.ZodObject ? outputSchema.passthrough() : outputSchema;
+  }
+
+  return z.object(outputSchema as z.ZodRawShape).passthrough();
+}
+
+function relaxMcpToolOutputSchema<TConfig extends { outputSchema?: unknown }>(
+  config: TConfig,
+): TConfig {
+  if (config.outputSchema === undefined) {
+    return config;
+  }
+
+  return {
+    ...config,
+    outputSchema: relaxMcpOutputSchema(config.outputSchema),
+  } as TConfig;
 }
 
 type McpToolContext = RequestHandlerExtra<ServerRequest, ServerNotification>;
@@ -370,15 +441,31 @@ interface ScheduleUpdateToolInput {
   clearExpires?: boolean;
 }
 
+function normalizeScheduleCadenceArg(value: string | undefined): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  return trimmed;
+}
+
 function resolveScheduleUpdateCadence(input: ScheduleUpdateToolInput): ScheduleCadence | undefined {
-  if (input.every !== undefined && input.cron !== undefined) {
+  const every = normalizeScheduleCadenceArg(input.every);
+  const cron = normalizeScheduleCadenceArg(input.cron);
+
+  if (every !== undefined && cron !== undefined) {
     throw new Error("Specify at most one of every or cron");
   }
-  if (input.every !== undefined) {
-    return { type: "every", everyMs: parseDurationString(input.every) };
+  if (every !== undefined) {
+    return { type: "every", everyMs: parseDurationString(every) };
   }
-  if (input.cron !== undefined) {
-    return { type: "cron", expression: input.cron.trim() };
+  if (cron !== undefined) {
+    return { type: "cron", expression: cron };
   }
   return undefined;
 }
@@ -508,7 +595,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
   });
   const registerRawTool = server.registerTool.bind(server);
   const registerTool: McpServer["registerTool"] = (name, config, handler) =>
-    registerRawTool(name, config, (async (args: never, extra: never) =>
+    registerRawTool(name, relaxMcpToolOutputSchema(config), (async (args: never, extra: never) =>
       addModelVisibleStructuredContent(await handler(args, extra))) as typeof handler);
 
   const resolveCallerAgent = () => {
@@ -563,6 +650,9 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
         : {}),
       ...(callerAgent.config.title ? { title: callerAgent.config.title } : {}),
       ...(callerAgent.config.extra ? { extra: callerAgent.config.extra } : {}),
+      ...(callerAgent.config.featureValues
+        ? { featureValues: callerAgent.config.featureValues }
+        : {}),
       ...(callerAgent.config.systemPrompt ? { systemPrompt: callerAgent.config.systemPrompt } : {}),
       ...(callerAgent.config.mcpServers ? { mcpServers: callerAgent.config.mcpServers } : {}),
     };
@@ -890,6 +980,48 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     return modes.some((mode) => mode.id === modeId && mode.isUnattended === true);
   };
 
+  const isAgentInUnattendedState = (agent: ManagedAgent): boolean => {
+    return (
+      isParentInUnattendedMode(agent.provider, agent.currentModeId) ||
+      hasOpenCodeAutoAcceptFeature(agent)
+    );
+  };
+
+  const resolveCreateModeAndFeatures = (input: {
+    provider: AgentProvider;
+    requestedMode: string | undefined;
+    parent: { provider: AgentProvider; modeId: string | null; isUnattended: boolean } | null;
+    features: Record<string, unknown> | undefined;
+  }): { mode: string | undefined; features: Record<string, unknown> | undefined } => {
+    const legacyOpenCodeFullAccess = isOpenCodeLegacyFullAccessMode(
+      input.provider,
+      input.requestedMode,
+    );
+    const inheritsOpenCodeUnattended =
+      input.provider === OPENCODE_PROVIDER_ID &&
+      input.requestedMode === undefined &&
+      input.parent?.isUnattended === true;
+    const inheritsOpenCodeAutoAccept =
+      inheritsOpenCodeUnattended && input.features?.[OPENCODE_AUTO_ACCEPT_FEATURE_ID] === undefined;
+    const requestedMode = legacyOpenCodeFullAccess ? OPENCODE_BUILD_MODE_ID : input.requestedMode;
+    const features =
+      legacyOpenCodeFullAccess || inheritsOpenCodeAutoAccept
+        ? withOpenCodeAutoAcceptFeature(input.features, true)
+        : input.features;
+    const mode =
+      inheritsOpenCodeUnattended && requestedMode === undefined
+        ? OPENCODE_BUILD_MODE_ID
+        : resolveAndValidateCreateAgentMode({
+            requestedMode,
+            targetProvider: input.provider,
+            parent: input.parent,
+            availableModes: getAvailableModeIds(input.provider),
+            targetUnattendedMode: getUnattendedModeId(input.provider),
+          });
+
+    return { mode, features };
+  };
+
   const resolveCallerCreateAgentArgs = (
     args: unknown,
     parentAgentId: string,
@@ -908,16 +1040,15 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
       lockedCwd: callerContext?.lockedCwd,
       allowCustomCwd: callerContext?.allowCustomCwd ?? true,
     });
-    const resolvedMode = resolveAndValidateCreateAgentMode({
+    const resolvedRuntime = resolveCreateModeAndFeatures({
+      provider,
       requestedMode: settings?.modeId,
-      targetProvider: provider,
       parent: {
         provider: parentAgent.provider,
         modeId: parentAgent.currentModeId,
-        isUnattended: isParentInUnattendedMode(parentAgent.provider, parentAgent.currentModeId),
+        isUnattended: isAgentInUnattendedState(parentAgent),
       },
-      availableModes: getAvailableModeIds(provider),
-      targetUnattendedMode: getUnattendedModeId(provider),
+      features: settings?.features,
     });
     return {
       provider,
@@ -926,11 +1057,11 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
       normalizedTitle: callerArgs.title.trim(),
       model: resolvedProviderModel.model,
       thinkingOptionId: settings?.thinkingOptionId,
-      features: settings?.features,
+      features: resolvedRuntime.features,
       labels: callerArgs.labels,
       notifyOnFinish: callerArgs.notifyOnFinish ?? false,
       resolvedCwd,
-      resolvedMode,
+      resolvedMode: resolvedRuntime.mode,
       setupContinuation: undefined,
     };
   };
@@ -942,12 +1073,11 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     const resolvedProviderModel = resolveRequiredProviderModel(topLevelArgs.provider);
     const { cwd, settings, worktreeName, baseBranch, refName, action, githubPrNumber } =
       topLevelArgs;
-    const resolvedMode = resolveAndValidateCreateAgentMode({
+    const resolvedRuntime = resolveCreateModeAndFeatures({
+      provider: resolvedProviderModel.provider,
       requestedMode: settings?.modeId,
-      targetProvider: resolvedProviderModel.provider,
       parent: null,
-      availableModes: getAvailableModeIds(resolvedProviderModel.provider),
-      targetUnattendedMode: getUnattendedModeId(resolvedProviderModel.provider),
+      features: settings?.features,
     });
     let resolvedCwd = expandUserPath(cwd);
     let setupContinuation: AgentWorktreeSetupContinuation | undefined;
@@ -1001,11 +1131,11 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
       normalizedTitle: topLevelArgs.title.trim(),
       model: resolvedProviderModel.model,
       thinkingOptionId: settings?.thinkingOptionId,
-      features: settings?.features,
+      features: resolvedRuntime.features,
       labels: topLevelArgs.labels,
       notifyOnFinish: topLevelArgs.notifyOnFinish ?? false,
       resolvedCwd,
-      resolvedMode,
+      resolvedMode: resolvedRuntime.mode,
       setupContinuation,
     };
   };
@@ -1023,13 +1153,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
         status: AgentStatusEnum,
         cwd: z.string(),
         currentModeId: z.string().nullable(),
-        availableModes: z.array(
-          z.object({
-            id: z.string(),
-            label: z.string(),
-            description: z.string().nullable().optional(),
-          }),
-        ),
+        availableModes: z.array(ProviderModeSchema),
         lastMessage: z.string().nullable().optional(),
         permission: AgentPermissionRequestPayloadSchema.nullable().optional(),
       },
@@ -1089,8 +1213,15 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
         logger: childLogger,
       });
 
+      let liveSnapshot = snapshot;
       try {
-        startAgentRun(agentManager, snapshot.id, trimmedPrompt, childLogger);
+        liveSnapshot = await startCreatedAgentInitialPrompt({
+          agentManager,
+          agentId: snapshot.id,
+          snapshot,
+          prompt: trimmedPrompt,
+          logger: childLogger,
+        });
         if (notifyOnFinish && callerAgentId) {
           setupFinishNotification({
             agentManager,
@@ -1108,12 +1239,12 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
           });
 
           const responseData = {
-            agentId: snapshot.id,
+            agentId: liveSnapshot.id,
             type: provider,
             status: result.status,
-            cwd: snapshot.cwd,
-            currentModeId: snapshot.currentModeId,
-            availableModes: snapshot.availableModes,
+            cwd: liveSnapshot.cwd,
+            currentModeId: liveSnapshot.currentModeId,
+            availableModes: liveSnapshot.availableModes,
             lastMessage: result.lastMessage,
             permission: sanitizePermissionRequest(result.permission),
           };
@@ -1127,18 +1258,20 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
         }
       } catch (error) {
         childLogger.error({ err: error, agentId: snapshot.id }, "Failed to run initial prompt");
+        throw error;
       }
 
       // Return immediately if background=true
+      const currentSnapshot = agentManager.getAgent(snapshot.id) ?? liveSnapshot;
       const response = {
         content: [],
         structuredContent: ensureValidJson({
-          agentId: snapshot.id,
+          agentId: currentSnapshot.id,
           type: provider,
-          status: snapshot.lifecycle,
-          cwd: snapshot.cwd,
-          currentModeId: snapshot.currentModeId,
-          availableModes: snapshot.availableModes,
+          status: currentSnapshot.lifecycle,
+          cwd: currentSnapshot.cwd,
+          currentModeId: currentSnapshot.currentModeId,
+          availableModes: currentSnapshot.availableModes,
           lastMessage: null,
           permission: null,
         }),
@@ -1268,7 +1401,6 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
         agentManager,
         agentStorage,
         agentId,
-        userMessageText: prompt,
         prompt,
         sessionMode,
         logger: childLogger,
@@ -1780,7 +1912,10 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
         throw new Error("Schedule service is not configured");
       }
 
-      const cadenceCount = Number(every !== undefined) + Number(cron !== undefined);
+      const normalizedEvery = normalizeScheduleCadenceArg(every);
+      const normalizedCron = normalizeScheduleCadenceArg(cron);
+      const cadenceCount =
+        Number(normalizedEvery !== undefined) + Number(normalizedCron !== undefined);
       if (cadenceCount !== 1) {
         throw new Error("Specify exactly one of every or cron");
       }
@@ -1818,9 +1953,10 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
 
       const schedule = await scheduleService.create({
         prompt: prompt.trim(),
-        cadence: every
-          ? { type: "every" as const, everyMs: parseDurationString(every) }
-          : { type: "cron" as const, expression: cron!.trim() },
+        cadence:
+          normalizedEvery !== undefined
+            ? { type: "every" as const, everyMs: parseDurationString(normalizedEvery) }
+            : { type: "cron" as const, expression: normalizedCron! },
         target: scheduleTarget,
         ...(name?.trim() ? { name: name.trim() } : {}),
         ...(maxRuns === undefined ? {} : { maxRuns }),

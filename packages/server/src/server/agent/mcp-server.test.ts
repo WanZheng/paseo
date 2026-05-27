@@ -4,7 +4,9 @@ import { realpathSync } from "node:fs";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { join, resolve as resolvePath } from "node:path";
 import { tmpdir } from "node:os";
+import Ajv from "ajv";
 import { z } from "zod";
+import { zodToJsonSchema } from "zod-to-json-schema";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { createAgentMcpServer } from "./mcp-server.js";
@@ -51,6 +53,7 @@ interface LooseStructuredContent {
 
 interface RegisteredMcpTool {
   inputSchema: LooseInputSchema;
+  outputSchema?: unknown;
   callback?: (
     input: unknown,
     extra?: unknown,
@@ -94,6 +97,23 @@ function registeredTool(
   return { ...tool, handler };
 }
 
+async function invokeToolWithParsedInput(
+  tool: RegisteredMcpToolWithHandler,
+  input: Record<string, unknown>,
+) {
+  const parsed = await tool.inputSchema.safeParseAsync(input);
+  expect(parsed.success).toBe(true);
+  return tool.handler(parsed.data);
+}
+
+function expectOutputSchemaAccepts(tool: RegisteredMcpTool, data: unknown): void {
+  expect(tool.outputSchema).toBeDefined();
+  const jsonSchema = zodToJsonSchema(tool.outputSchema as z.ZodTypeAny);
+  const ajv = new Ajv({ allErrors: true, strict: false });
+  const validate = ajv.compile(jsonSchema);
+  expect(validate(data), JSON.stringify(validate.errors, null, 2)).toBe(true);
+}
+
 function agentsOf(response: {
   structuredContent: LooseStructuredContent;
 }): Array<Record<string, unknown>> {
@@ -115,7 +135,11 @@ interface TestDeps {
 function buildAgentManagerSpies() {
   return {
     createAgent: vi.fn(),
-    waitForAgentEvent: vi.fn(),
+    waitForAgentEvent: vi.fn().mockResolvedValue({
+      status: "idle",
+      permission: null,
+      lastMessage: null,
+    }),
     setAgentMode: vi.fn().mockResolvedValue(undefined),
     setAgentModel: vi.fn().mockResolvedValue(undefined),
     setAgentThinkingOption: vi.fn().mockResolvedValue(undefined),
@@ -132,8 +156,10 @@ function buildAgentManagerSpies() {
     appendTimelineItem: vi.fn().mockResolvedValue(undefined),
     emitLiveTimelineItem: vi.fn().mockResolvedValue(undefined),
     hasInFlightRun: vi.fn().mockReturnValue(false),
+    tryRunOutOfBand: vi.fn().mockReturnValue(false),
     subscribe: vi.fn().mockReturnValue(() => {}),
     streamAgent: vi.fn(() => (async function* noop() {})()),
+    waitForAgentRunStart: vi.fn().mockResolvedValue(undefined),
     respondToPermission: vi.fn(),
     cancelAgentRun: vi.fn(),
     getPendingPermissions: vi.fn(),
@@ -528,6 +554,38 @@ describe("create_agent MCP tool", () => {
       undefined,
       undefined,
     );
+  });
+
+  it("advertises create_agent output schema that accepts full provider modes", async () => {
+    const { agentManager, agentStorage, spies } = createTestDeps();
+    spies.agentManager.createAgent.mockResolvedValue({
+      id: "mode-agent",
+      cwd: REPO_CWD,
+      lifecycle: "idle",
+      currentModeId: "build",
+      availableModes: [
+        {
+          id: "build",
+          label: "Build",
+          description: null,
+          icon: "hammer",
+          colorTier: "dangerous",
+        },
+      ],
+      config: { title: "Mode test" },
+    } as ManagedAgent);
+
+    const server = await createAgentMcpServer({ agentManager, agentStorage, logger });
+    const tool = registeredTool(server, "create_agent");
+    const response = await tool.handler({
+      cwd: existingCwd,
+      title: "Mode test",
+      provider: "codex/gpt-5.4",
+      initialPrompt: "Do work",
+      background: true,
+    });
+
+    expectOutputSchemaAccepts(tool, response.structuredContent);
   });
 
   it("requires provider as provider/model and rejects the old model field", async () => {
@@ -1432,9 +1490,37 @@ describe("create_agent MCP tool", () => {
         initialPrompt: "Do work",
       }),
     ).rejects.toThrow(
-      "Invalid mode 'bypassPermissions' for provider 'opencode'. Available modes: build, full-access, plan",
+      "Invalid mode 'bypassPermissions' for provider 'opencode'. Available modes: build, plan",
     );
     expect(spies.agentManager.createAgent).not.toHaveBeenCalled();
+  });
+
+  it("accepts legacy OpenCode full-access as build plus auto accept", async () => {
+    const { agentManager, agentStorage, spies } = createTestDeps();
+    spies.agentManager.createAgent.mockResolvedValue({
+      id: "child-agent",
+      cwd: existingCwd,
+      lifecycle: "idle",
+      currentModeId: "build",
+      availableModes: [],
+      config: { title: "Child", featureValues: { auto_accept: true } },
+    } as ManagedAgent);
+    const server = await createAgentMcpServer({ agentManager, agentStorage, logger });
+    const tool = registeredTool(server, "create_agent");
+
+    await tool.handler({
+      cwd: existingCwd,
+      title: "Legacy mode",
+      provider: "opencode/gpt-5.4",
+      settings: { modeId: "full-access" },
+      initialPrompt: "Do work",
+    });
+
+    expect(spies.agentManager.createAgent).toHaveBeenCalledWith(
+      expect.objectContaining({ modeId: "build", featureValues: { auto_accept: true } }),
+      undefined,
+      undefined,
+    );
   });
 
   it("inherits the caller mode when the new agent uses the same provider", async () => {
@@ -1498,12 +1584,12 @@ describe("create_agent MCP tool", () => {
         initialPrompt: "Do work",
       }),
     ).rejects.toThrow(
-      "cannot inherit mode 'default' from caller (provider 'claude') for new agent (provider 'opencode'). Pass an explicit mode. Available modes for 'opencode': build, full-access, plan",
+      "cannot inherit mode 'default' from caller (provider 'claude') for new agent (provider 'opencode'). Pass an explicit mode. Available modes for 'opencode': build, plan",
     );
     expect(spies.agentManager.createAgent).not.toHaveBeenCalled();
   });
 
-  it("inherits the target provider's unattended mode when caller is unattended cross-provider", async () => {
+  it("maps unattended callers to OpenCode auto accept", async () => {
     const { agentManager, agentStorage, spies } = createTestDeps();
     spies.agentManager.getAgent.mockReturnValue({
       id: "parent-agent",
@@ -1515,9 +1601,9 @@ describe("create_agent MCP tool", () => {
       id: "child-agent",
       cwd: existingCwd,
       lifecycle: "idle",
-      currentModeId: "full-access",
+      currentModeId: "build",
       availableModes: [],
-      config: { title: "Child" },
+      config: { title: "Child", featureValues: { auto_accept: true } },
     } as ManagedAgent);
 
     const server = await createAgentMcpServer({
@@ -1534,7 +1620,7 @@ describe("create_agent MCP tool", () => {
     });
 
     expect(spies.agentManager.createAgent).toHaveBeenCalledWith(
-      expect.objectContaining({ modeId: "full-access" }),
+      expect.objectContaining({ modeId: "build", featureValues: { auto_accept: true } }),
       undefined,
       expect.any(Object),
     );
@@ -1718,6 +1804,170 @@ describe("create_schedule MCP tool", () => {
       }),
     );
   });
+
+  it("advertises create_schedule output schema that accepts inherited feature values", async () => {
+    const { agentManager, agentStorage, spies } = createTestDeps();
+    spies.agentManager.getAgent.mockReturnValue({
+      id: "parent-agent",
+      provider: "opencode",
+      cwd: REPO_CWD,
+      lifecycle: "idle",
+      currentModeId: "build",
+      availableModes: [],
+      config: {
+        title: "Parent agent",
+        model: "openai/gpt-5.5",
+        featureValues: { auto_accept: true },
+      },
+    } as ManagedAgent);
+    const create = vi.fn(async (input: CreateScheduleInput) => createStoredSchedule(input));
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      scheduleService: { create } as unknown as ScheduleService,
+      callerAgentId: "parent-agent",
+      logger,
+    });
+    const tool = registeredTool(server, "create_schedule");
+
+    const response = await tool.handler({
+      prompt: "say hello",
+      every: "5m",
+      target: "new-agent",
+      provider: "opencode/openai/gpt-5.5",
+    });
+
+    expect(response.structuredContent.target).toMatchObject({
+      type: "new-agent",
+      config: { featureValues: { auto_accept: true } },
+    });
+    expectOutputSchemaAccepts(tool, response.structuredContent);
+  });
+
+  it("accepts a blank cron field when every is provided", async () => {
+    const { agentManager, agentStorage } = createTestDeps();
+    const create = vi.fn(async (scheduleInput: CreateScheduleInput) =>
+      createStoredSchedule(scheduleInput),
+    );
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      scheduleService: { create } as unknown as ScheduleService,
+      logger,
+    });
+    const tool = registeredTool(server, "create_schedule");
+
+    await invokeToolWithParsedInput(tool, {
+      prompt: "say hello",
+      every: "10m",
+      cron: "",
+      provider: "codex",
+    });
+
+    expect(create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cadence: { type: "every", everyMs: 600000 },
+      }),
+    );
+  });
+
+  it.each([
+    {
+      label: "whitespace cron field",
+      input: { prompt: "say hello", every: "10m", cron: "   ", provider: "codex" },
+      cadence: { type: "every", everyMs: 600000 },
+    },
+    {
+      label: "blank every field for cron cadence",
+      input: {
+        prompt: "say hello",
+        every: "",
+        cron: "*/10 * * * *",
+        provider: "codex",
+      },
+      cadence: { type: "cron", expression: "*/10 * * * *" },
+    },
+    {
+      label: "whitespace every field for cron cadence",
+      input: {
+        prompt: "say hello",
+        every: "   ",
+        cron: "*/10 * * * *",
+        provider: "codex",
+      },
+      cadence: { type: "cron", expression: "*/10 * * * *" },
+    },
+  ])("normalizes create_schedule blank cadence input for $label", async ({ input, cadence }) => {
+    const { agentManager, agentStorage } = createTestDeps();
+    const create = vi.fn(async (scheduleInput: CreateScheduleInput) =>
+      createStoredSchedule(scheduleInput),
+    );
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      scheduleService: { create } as unknown as ScheduleService,
+      logger,
+    });
+    const tool = registeredTool(server, "create_schedule");
+
+    await invokeToolWithParsedInput(tool, input);
+
+    expect(create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cadence,
+      }),
+    );
+  });
+
+  it("still rejects both real every and cron inputs", async () => {
+    const { agentManager, agentStorage } = createTestDeps();
+    const create = vi.fn();
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      scheduleService: { create } as unknown as ScheduleService,
+      logger,
+    });
+    const tool = registeredTool(server, "create_schedule");
+
+    await expect(
+      invokeToolWithParsedInput(tool, {
+        prompt: "say hello",
+        every: "10m",
+        cron: "*/10 * * * *",
+        provider: "codex",
+      }),
+    ).rejects.toThrow("Specify exactly one of every or cron");
+
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      label: "missing both cadence fields",
+      input: { prompt: "say hello", provider: "codex" },
+    },
+    {
+      label: "blank cadence fields",
+      input: { prompt: "say hello", every: "   ", cron: "", provider: "codex" },
+    },
+  ])("still rejects create_schedule when $label", async ({ input }) => {
+    const { agentManager, agentStorage } = createTestDeps();
+    const create = vi.fn();
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      scheduleService: { create } as unknown as ScheduleService,
+      logger,
+    });
+    const tool = registeredTool(server, "create_schedule");
+
+    await expect(invokeToolWithParsedInput(tool, input)).rejects.toThrow(
+      "Specify exactly one of every or cron",
+    );
+
+    expect(create).not.toHaveBeenCalled();
+  });
 });
 
 describe("update_schedule MCP tool", () => {
@@ -1792,6 +2042,66 @@ describe("update_schedule MCP tool", () => {
     expect(update).toHaveBeenCalledWith({
       id: "schedule-1",
       cadence: { type: "every", everyMs: 600000 },
+    });
+  });
+
+  it("accepts a blank cron field when updating every cadence", async () => {
+    const { agentManager, agentStorage } = createTestDeps();
+    const stored = makeStoredSchedule();
+    const update = vi.fn(async (_input: UpdateScheduleInput) => stored);
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      scheduleService: { update } as unknown as ScheduleService,
+      logger,
+    });
+    const tool = registeredTool(server, "update_schedule");
+
+    await invokeToolWithParsedInput(tool, {
+      id: "schedule-1",
+      every: "10m",
+      cron: "",
+    });
+
+    expect(update).toHaveBeenCalledWith({
+      id: "schedule-1",
+      cadence: { type: "every", everyMs: 600000 },
+    });
+  });
+
+  it.each([
+    {
+      label: "whitespace cron field",
+      input: { id: "schedule-1", every: "10m", cron: "   " },
+      cadence: { type: "every", everyMs: 600000 },
+    },
+    {
+      label: "blank every field for cron cadence",
+      input: { id: "schedule-1", every: "", cron: "*/10 * * * *" },
+      cadence: { type: "cron", expression: "*/10 * * * *" },
+    },
+    {
+      label: "whitespace every field for cron cadence",
+      input: { id: "schedule-1", every: "   ", cron: "*/10 * * * *" },
+      cadence: { type: "cron", expression: "*/10 * * * *" },
+    },
+  ])("normalizes update_schedule blank cadence input for $label", async ({ input, cadence }) => {
+    const { agentManager, agentStorage } = createTestDeps();
+    const stored = makeStoredSchedule();
+    const update = vi.fn(async (_input: UpdateScheduleInput) => stored);
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      scheduleService: { update } as unknown as ScheduleService,
+      logger,
+    });
+    const tool = registeredTool(server, "update_schedule");
+
+    await invokeToolWithParsedInput(tool, input);
+
+    expect(update).toHaveBeenCalledWith({
+      id: "schedule-1",
+      cadence,
     });
   });
 

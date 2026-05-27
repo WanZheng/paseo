@@ -56,6 +56,7 @@ import { ForegroundRunState, type ForegroundTurnWaiter } from "./foreground-run-
 import { getAgentProviderDefinition } from "./provider-manifest.js";
 import { IMPORTABLE_PROVIDERS } from "./provider-registry.js";
 import { invokeRewindCapability, type RewindMode } from "./rewind/rewind.js";
+import { isSystemInjectedEnvelope } from "./agent-prompt.js";
 
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
@@ -91,7 +92,6 @@ function buildStoredAgentConfig(record: StoredAgentRecord): AgentSessionConfig {
   if (!record.config) {
     return config;
   }
-  if (record.config.title != null) config.title = record.config.title;
   if (record.config.modeId != null) config.modeId = record.config.modeId;
   if (record.config.model != null) config.model = record.config.model;
   if (record.config.thinkingOptionId != null) {
@@ -793,6 +793,7 @@ export class AgentManager {
       initialPrompt?: string;
       env?: Record<string, string>;
       persistSession?: boolean;
+      initialTitle?: string | null;
     },
   ): Promise<ManagedAgent> {
     const resolvedAgentId = validateAgentId(agentId ?? this.idFactory(), "createAgent");
@@ -822,6 +823,7 @@ export class AgentManager {
     return this.registerSession(session, normalizedConfig, resolvedAgentId, {
       labels: options?.labels,
       workspaceId: options?.workspaceId,
+      initialTitle: options?.initialTitle,
     });
   }
 
@@ -1154,11 +1156,12 @@ export class AgentManager {
   async setAgentMode(agentId: string, modeId: string): Promise<void> {
     const agent = this.requireSessionAgent(agentId);
     await agent.session.setMode(modeId);
-    agent.config.modeId = modeId;
-    agent.currentModeId = modeId;
+    const currentMode = await agent.session.getCurrentMode();
+    agent.config.modeId = currentMode ?? undefined;
+    agent.currentModeId = currentMode;
     // Update runtimeInfo to reflect the new mode
     if (agent.runtimeInfo) {
-      agent.runtimeInfo = { ...agent.runtimeInfo, modeId };
+      agent.runtimeInfo = { ...agent.runtimeInfo, modeId: currentMode };
     }
     this.touchUpdatedAt(agent);
     this.emitState(agent);
@@ -1234,7 +1237,7 @@ export class AgentManager {
     this.emitState(agent, { persist: false });
   }
 
-  async setGeneratedTitleIfUnset(agentId: string, title: string): Promise<void> {
+  async setGeneratedTitle(agentId: string, title: string): Promise<void> {
     const agent = this.requireAgent(agentId);
     const normalizedTitle = title.trim();
     if (!normalizedTitle) {
@@ -1242,10 +1245,7 @@ export class AgentManager {
     }
 
     const registry = this.requireRegistry();
-    const persisted = await registry.setGeneratedTitleIfUnset(agent.id, normalizedTitle);
-    if (!persisted) {
-      return;
-    }
+    const persisted = await registry.setGeneratedTitle(agent.id, normalizedTitle);
 
     agent.updatedAt = new Date(persisted.updatedAt);
     this.emitState(agent, { persist: false });
@@ -2243,13 +2243,18 @@ export class AgentManager {
       lastUsage?: AgentUsage;
       lastError?: string;
       attention?: AttentionState;
+      initialTitle?: string | null;
     },
   ): Promise<ManagedAgent> {
     const resolvedAgentId = validateAgentId(agentId, "registerSession");
     if (this.agents.has(resolvedAgentId)) {
       throw new Error(`Agent with id ${resolvedAgentId} already exists`);
     }
-    const initialPersistedTitle = await this.resolveInitialPersistedTitle(resolvedAgentId, config);
+    const initialPersistedTitle = await this.resolveInitialPersistedTitle(
+      resolvedAgentId,
+      config,
+      options?.initialTitle ?? null,
+    );
 
     const now = new Date();
     const { durableTimelineHasRows } = await this.initializeAgentTimelineForRegister({
@@ -2520,15 +2525,17 @@ export class AgentManager {
   private async resolveInitialPersistedTitle(
     agentId: string,
     config: AgentSessionConfig,
+    fallbackTitle: string | null,
   ): Promise<string | null> {
     const existing = await this.registry?.get(agentId);
     if (existing) {
       return existing.title ?? null;
     }
-    if (Object.prototype.hasOwnProperty.call(config, "title")) {
-      return config.title ?? null;
-    }
-    return null;
+    const explicitTitle =
+      typeof config.title === "string" && config.title.trim().length > 0
+        ? config.title.trim()
+        : null;
+    return explicitTitle ?? fallbackTitle;
   }
 
   private async persistSnapshot(
@@ -2617,6 +2624,9 @@ export class AgentManager {
       const historyEvents: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
       for await (const event of agent.session.streamHistory()) {
         if (event.type === "timeline") {
+          if (event.item.type === "user_message" && isSystemInjectedEnvelope(event.item.text)) {
+            continue;
+          }
           historyEvents.push(event);
         }
       }
@@ -2650,6 +2660,9 @@ export class AgentManager {
     try {
       for await (const event of agent.session.streamHistory()) {
         if (event.type !== "timeline") {
+          continue;
+        }
+        if (event.item.type === "user_message" && isSystemInjectedEnvelope(event.item.text)) {
           continue;
         }
         this.recordTimeline(
@@ -2898,6 +2911,12 @@ export class AgentManager {
     flags: StreamEventFlags;
   }): Promise<void> {
     const { agent, event, options, flags } = params;
+
+    if (event.item.type === "user_message" && isSystemInjectedEnvelope(event.item.text)) {
+      flags.shouldDispatchEvent = false;
+      flags.shouldNotifyWaiters = false;
+      return;
+    }
 
     if (options?.fromHistory) {
       this.recordTimeline(
