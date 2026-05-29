@@ -154,6 +154,20 @@ describe("PiCliRuntime", () => {
     expect(events).toEqual([{ type: "turn_start" }]);
   });
 
+  test("sets approval mode over RPC", async () => {
+    const child = createPiChild();
+    const commands: string[] = [];
+    replyToCommands(child, (command) => {
+      commands.push(String(command.type));
+      return {};
+    });
+    const session = await createRuntime(child).startSession({ cwd: "/workspace/project" });
+
+    await session.setApprovalMode("write");
+
+    expect(commands).toEqual(["set_approval_mode"]);
+  });
+
   test("keeps unicode line separators inside one JSONL record", async () => {
     const child = createPiChild();
     replyToCommands(child, () => ({}));

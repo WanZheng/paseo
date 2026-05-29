@@ -7,6 +7,7 @@ import type {
   PiSessionStats,
 } from "./rpc-types.js";
 import type { ProviderRuntimeSettings } from "../../provider-launch-config.js";
+import type { PiApprovalMode } from "./family-config.js";
 
 export interface PiRuntimeLaunch {
   cwd: string;
@@ -14,6 +15,7 @@ export interface PiRuntimeLaunch {
   env?: Record<string, string>;
   model?: string;
   thinkingOptionId?: string;
+  approvalMode?: PiApprovalMode;
   session?: string;
   systemPrompt?: string;
   mcpConfigPath?: string;
@@ -25,6 +27,7 @@ export interface PiStartSessionInput {
   env?: Record<string, string>;
   model?: string;
   thinkingOptionId?: string;
+  approvalMode?: PiApprovalMode;
   session?: string;
   systemPrompt?: string;
   mcpConfigPath?: string;
@@ -43,6 +46,7 @@ export interface PiRuntimeSession {
   getAvailableModels(): Promise<PiModel[]>;
   setModel(provider: string, modelId: string): Promise<PiModel>;
   setThinkingLevel(level: string): Promise<void>;
+  setApprovalMode(mode: PiApprovalMode): Promise<void>;
   getSessionStats(): Promise<PiSessionStats>;
   getCommands(): Promise<PiRpcSlashCommand[]>;
   respondToExtensionUiRequest(
@@ -77,6 +81,9 @@ export function buildPiLaunch(input: {
   if (input.session.thinkingOptionId) {
     argv.push("--thinking", input.session.thinkingOptionId);
   }
+  if (input.session.approvalMode) {
+    argv.push("--approval-mode", input.session.approvalMode);
+  }
   if (input.session.session) {
     argv.push("--session", input.session.session);
   }
@@ -103,6 +110,7 @@ export function buildPiLaunch(input: {
         : undefined,
     model: input.session.model,
     thinkingOptionId: input.session.thinkingOptionId,
+    approvalMode: input.session.approvalMode,
     session: input.session.session,
     systemPrompt,
     mcpConfigPath: input.session.mcpConfigPath,

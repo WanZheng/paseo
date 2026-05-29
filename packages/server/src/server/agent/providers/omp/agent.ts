@@ -16,7 +16,7 @@ import { listOmpPersistedAgents } from "./session-descriptor.js";
  * fork of Pi that ships its own binary (`omp`), home directory (`~/.omp`), and
  * plugin ecosystem. It preserves Pi's `--mode rpc` wire protocol and JSONL
  * session schema verbatim, so the entire Pi adapter is reused — only family
- * defaults differ.
+ * defaults and OMP-specific launch flags differ.
  *
  * Unlike Pi (which uses Paseo-injected `paseo_capture_entries` extensions to
  * track session identity at runtime), OMP sessions started outside Paseo —

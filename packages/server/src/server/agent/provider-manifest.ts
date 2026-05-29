@@ -143,6 +143,31 @@ const OPENCODE_MODES: AgentProviderModeDefinition[] = [
   },
 ];
 
+const OMP_MODES: AgentProviderModeDefinition[] = [
+  {
+    id: "always-ask",
+    label: "Always Ask",
+    description: "Auto-approves read-only tools and prompts for writes or command execution",
+    icon: "ShieldCheck",
+    colorTier: "safe",
+  },
+  {
+    id: "write",
+    label: "Write",
+    description: "Auto-approves read and workspace-write tools, then prompts for command execution",
+    icon: "ShieldAlert",
+    colorTier: "moderate",
+  },
+  {
+    id: "yolo",
+    label: "YOLO",
+    description: "Auto-approves all OMP tool calls",
+    icon: "ShieldOff",
+    colorTier: "dangerous",
+    isUnattended: true,
+  },
+];
+
 const MOCK_LOAD_TEST_MODES: AgentProviderModeDefinition[] = [
   {
     id: "load-test",
@@ -207,8 +232,8 @@ export const AGENT_PROVIDER_DEFINITIONS: AgentProviderDefinition[] = [
     id: "omp",
     label: "OMP",
     description: "Oh-My-Pi: Pi fork with extended plugin ecosystem (~/.omp)",
-    defaultModeId: null,
-    modes: [],
+    defaultModeId: "yolo",
+    modes: OMP_MODES,
   },
 ];
 

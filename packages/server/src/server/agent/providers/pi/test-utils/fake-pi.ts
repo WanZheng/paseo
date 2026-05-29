@@ -4,6 +4,7 @@ import type {
   PiRuntimeSession,
   PiStartSessionInput,
 } from "../runtime.js";
+import type { PiApprovalMode } from "../family-config.js";
 import type {
   PiAgentMessage,
   PiModel,
@@ -53,6 +54,7 @@ export class FakePiSession implements PiRuntimeSession {
   readonly prompts: Array<{ message: string; imageCount: number }> = [];
   readonly setModelRequests: Array<{ provider: string; modelId: string }> = [];
   readonly setThinkingLevelRequests: string[] = [];
+  readonly setApprovalModeRequests: PiApprovalMode[] = [];
   readonly treeNavigationRequests: string[] = [];
   capturedUserEntries: Array<{ id: string; parentId: string | null; text: string }> = [];
   abortRequested = false;
@@ -62,6 +64,7 @@ export class FakePiSession implements PiRuntimeSession {
     response: { value?: string; confirmed?: boolean; cancelled?: boolean };
   }> = [];
   setModelResult: PiModel | null = null;
+  setApprovalModeError: Error | null = null;
   models: PiModel[] = [];
   messages: PiAgentMessage[] = [];
   stats: PiSessionStats = {
@@ -128,6 +131,17 @@ export class FakePiSession implements PiRuntimeSession {
 
   async setThinkingLevel(level: string): Promise<void> {
     this.setThinkingLevelRequests.push(level);
+  }
+
+  async setApprovalMode(mode: PiApprovalMode): Promise<void> {
+    this.setApprovalModeRequests.push(mode);
+    if (this.setApprovalModeError) {
+      throw this.setApprovalModeError;
+    }
+    this.state = {
+      ...this.state,
+      approvalMode: mode,
+    };
   }
 
   async getSessionStats(): Promise<PiSessionStats> {

@@ -1,3 +1,5 @@
+import type { PiApprovalMode } from "./family-config.js";
+
 export type PiThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
 export interface PiImageContent {
@@ -73,6 +75,7 @@ export interface PiModel {
 export interface PiSessionState {
   model?: PiModel | null;
   thinkingLevel: PiThinkingLevel;
+  approvalMode?: PiApprovalMode;
   isStreaming: boolean;
   isCompacting: boolean;
   sessionFile?: string;
@@ -113,6 +116,7 @@ export type PiRpcCommand =
   | { id?: string; type: "get_available_models" }
   | { id?: string; type: "set_model"; provider: string; modelId: string }
   | { id?: string; type: "set_thinking_level"; level: PiThinkingLevel }
+  | { id?: string; type: "set_approval_mode"; mode: PiApprovalMode }
   | { id?: string; type: "get_session_stats" }
   | { id?: string; type: "get_commands" };
 

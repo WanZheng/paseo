@@ -16,6 +16,13 @@ function createClientWithOmpAgentDir(agentDir: string): OmpRpcAgentClient {
   });
 }
 
+function createClient(pi = new FakePi(["omp"])): OmpRpcAgentClient {
+  return new OmpRpcAgentClient({
+    logger: pino({ level: "silent" }),
+    runtime: pi,
+  });
+}
+
 function createConfig(overrides: Partial<AgentSessionConfig> = {}): AgentSessionConfig {
   return {
     provider: "omp",
@@ -42,6 +49,106 @@ describe("OmpRpcAgentClient", () => {
     const session = await client.createSession(createConfig());
     expect(session.provider).toBe("omp");
     await session.close();
+  });
+
+  test("lists OMP approval modes", async () => {
+    await expect(createClient().listModes({ cwd: "/tmp/project", force: false })).resolves.toEqual([
+      {
+        id: "always-ask",
+        label: "Always Ask",
+        description: "Auto-approves read-only tools and prompts for writes or command execution",
+      },
+      {
+        id: "write",
+        label: "Write",
+        description:
+          "Auto-approves read and workspace-write tools, then prompts for command execution",
+      },
+      {
+        id: "yolo",
+        label: "YOLO",
+        description: "Auto-approves all OMP tool calls",
+      },
+    ]);
+  });
+
+  test("launches OMP with the selected approval mode", async () => {
+    const pi = new FakePi(["omp"]);
+    const client = createClient(pi);
+
+    await client.createSession(createConfig({ modeId: "write" }));
+
+    const actualLaunch = pi.recordedLaunches[0]!;
+    expect(actualLaunch.extensionPaths).toHaveLength(1);
+    expect(actualLaunch.argv).toEqual([
+      "omp",
+      "--mode",
+      "rpc",
+      "--thinking",
+      "medium",
+      "--approval-mode",
+      "write",
+      "--extension",
+      actualLaunch.extensionPaths[0],
+    ]);
+  });
+
+  test("defaults OMP approval mode to yolo", async () => {
+    const pi = new FakePi(["omp"]);
+    const client = createClient(pi);
+    const session = await client.createSession(createConfig());
+
+    expect(await session.getCurrentMode()).toBe("yolo");
+    expect(pi.recordedLaunches[0]?.argv).toContain("yolo");
+  });
+
+  test("updates OMP approval mode through RPC when switching modes", async () => {
+    const pi = new FakePi(["omp"]);
+    const client = createClient(pi);
+    const session = await client.createSession(createConfig({ modeId: "always-ask" }));
+
+    await session.setMode("write");
+
+    expect(await session.getCurrentMode()).toBe("write");
+    expect(pi.recordedLaunches).toHaveLength(1);
+    expect(pi.latestSession().setApprovalModeRequests).toEqual(["write"]);
+  });
+
+  test("falls back to restarting OMP when RPC approval mode switching is unsupported", async () => {
+    const pi = new FakePi(["omp"]);
+    const client = createClient(pi);
+    const session = await client.createSession(createConfig({ modeId: "always-ask" }));
+    pi.latestSession().setApprovalModeError = new Error(
+      "Pi RPC request timed out for set_approval_mode",
+    );
+
+    await session.setMode("write");
+
+    expect(await session.getCurrentMode()).toBe("write");
+    expect(pi.recordedLaunches).toHaveLength(2);
+    const restartLaunch = pi.recordedLaunches[1]!;
+    expect(restartLaunch.extensionPaths).toHaveLength(1);
+    expect(restartLaunch.argv).toEqual([
+      "omp",
+      "--mode",
+      "rpc",
+      "--thinking",
+      "medium",
+      "--approval-mode",
+      "write",
+      "--session",
+      "/tmp/pi-session",
+      "--extension",
+      restartLaunch.extensionPaths[0],
+    ]);
+  });
+
+  test("rejects invalid OMP approval modes", async () => {
+    const session = await createClient().createSession(createConfig({ modeId: "write" }));
+
+    await expect(session.setMode("invalid")).rejects.toThrow(
+      'Invalid OMP mode "invalid". Valid modes are: always-ask, write, yolo',
+    );
   });
 
   test("lists persisted OMP sessions from the configured OMP agent directory", async () => {

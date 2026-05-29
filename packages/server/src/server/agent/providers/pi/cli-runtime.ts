@@ -4,7 +4,12 @@ import type { Logger } from "pino";
 import { spawnProcess } from "../../../../utils/spawn.js";
 import { terminateWithTreeKill } from "../../../../utils/tree-kill.js";
 import type { ProviderRuntimeSettings } from "../../provider-launch-config.js";
-import { PI_FAMILY, type PiFamilyConfig, resolveFamilyBinaryName } from "./family-config.js";
+import {
+  PI_FAMILY,
+  type PiApprovalMode,
+  type PiFamilyConfig,
+  resolveFamilyBinaryName,
+} from "./family-config.js";
 import {
   buildPiLaunch,
   type PiRuntime,
@@ -27,6 +32,7 @@ function defaultCommandForFamily(family: PiFamilyConfig): [string, ...string[]] 
   return [resolveFamilyBinaryName(family)];
 }
 const DEFAULT_TIMEOUT_MS = 30_000;
+const SET_APPROVAL_MODE_TIMEOUT_MS = 3_000;
 const STDERR_BUFFER_LIMIT = 8192;
 const GRACEFUL_SHUTDOWN_TIMEOUT_MS = 2_000;
 const FORCE_SHUTDOWN_TIMEOUT_MS = 1_000;
@@ -159,6 +165,10 @@ class PiCliRuntimeSession implements PiRuntimeSession {
 
   async setThinkingLevel(level: string): Promise<void> {
     await this.request({ type: "set_thinking_level", level: level as never });
+  }
+
+  async setApprovalMode(mode: PiApprovalMode): Promise<void> {
+    await this.request({ type: "set_approval_mode", mode }, SET_APPROVAL_MODE_TIMEOUT_MS);
   }
 
   async getSessionStats(): Promise<PiSessionStats> {

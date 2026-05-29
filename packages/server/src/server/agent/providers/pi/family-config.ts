@@ -4,12 +4,14 @@
  * Pi (https://github.com/earendil-works/pi-coding-agent) and OMP (Oh-My-Pi,
  * https://github.com/oh-my-pi/pi-coding-agent) speak the same JSONL session
  * format and the same `--mode rpc` wire protocol. They differ only in binary
- * name and home directory. Everything else — message schema, tool calls,
- * permission dialogs, MCP adapter, model labels, Paseo's `paseo_capture_entries`
- * / `paseo_tree` extension commands — is identical.
+ * name, home directory, and family-specific launch flags such as OMP approval
+ * modes. Everything else — message schema, tool calls, permission dialogs, MCP
+ * adapter, model labels, Paseo's `paseo_capture_entries` / `paseo_tree`
+ * extension commands — is identical.
  *
  * The Pi adapter is parameterized over this family config so OMP can reuse
- * the entire implementation by swapping a handful of identifiers.
+ * the entire implementation by swapping a handful of identifiers and optional
+ * feature flags.
  */
 export interface PiFamilyConfig {
   /** Provider id used in AgentStreamEvent payloads and the provider registry. */
@@ -35,6 +37,19 @@ export interface PiFamilyConfig {
    * package via its plugin loader, so both families share the marker.
    */
   readonly mcpAdapterMarker: string;
+  /** Optional approval/permission modes supported by this Pi-family binary. */
+  readonly approvalModes?: ReadonlyArray<PiApprovalModeDefinition>;
+  /** Default approval mode used when no Paseo modeId is supplied. */
+  readonly defaultApprovalMode?: PiApprovalMode;
+}
+
+export type PiApprovalMode = "always-ask" | "write" | "yolo";
+
+export interface PiApprovalModeDefinition {
+  id: PiApprovalMode;
+  label: string;
+  description: string;
+  isUnattended?: boolean;
 }
 
 export const PI_FAMILY: PiFamilyConfig = {
@@ -57,6 +72,26 @@ export const OMP_FAMILY: PiFamilyConfig = {
   sessionDirEnv: "OMP_CODING_AGENT_SESSION_DIR",
   displayLabel: "OMP",
   mcpAdapterMarker: "pi-mcp-adapter",
+  defaultApprovalMode: "yolo",
+  approvalModes: [
+    {
+      id: "always-ask",
+      label: "Always Ask",
+      description: "Auto-approves read-only tools and prompts for writes or command execution",
+    },
+    {
+      id: "write",
+      label: "Write",
+      description:
+        "Auto-approves read and workspace-write tools, then prompts for command execution",
+    },
+    {
+      id: "yolo",
+      label: "YOLO",
+      description: "Auto-approves all OMP tool calls",
+      isUnattended: true,
+    },
+  ],
 };
 
 /**
@@ -74,4 +109,25 @@ export function resolveFamilyBinaryName(
     }
   }
   return family.binaryName;
+}
+
+export function resolveFamilyApprovalMode(
+  family: PiFamilyConfig,
+  modeId: string | null | undefined,
+): PiApprovalMode | null {
+  if (!family.approvalModes) {
+    return null;
+  }
+  const requestedModeId = modeId ?? family.defaultApprovalMode;
+  if (!requestedModeId) {
+    return null;
+  }
+  const mode = family.approvalModes.find((entry) => entry.id === requestedModeId);
+  if (!mode) {
+    const validModes = family.approvalModes.map((entry) => entry.id).join(", ");
+    throw new Error(
+      `Invalid ${family.displayLabel} mode "${requestedModeId}". Valid modes are: ${validModes}`,
+    );
+  }
+  return mode.id;
 }

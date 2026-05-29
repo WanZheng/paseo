@@ -48,8 +48,14 @@ import {
 } from "./history-mapper.js";
 import { PiCliRuntime } from "./cli-runtime.js";
 import { revertPiConversation } from "./rewind.js";
-import { PI_FAMILY, type PiFamilyConfig, resolveFamilyBinaryName } from "./family-config.js";
-import type { PiRuntime, PiRuntimeSession } from "./runtime.js";
+import {
+  PI_FAMILY,
+  type PiApprovalMode,
+  type PiFamilyConfig,
+  resolveFamilyApprovalMode,
+  resolveFamilyBinaryName,
+} from "./family-config.js";
+import type { PiRuntime, PiRuntimeSession, PiStartSessionInput } from "./runtime.js";
 import type {
   PiAgentSessionEvent,
   PiAgentMessage,
@@ -124,6 +130,7 @@ interface PiPersistenceMetadata {
   cwd?: string;
   model?: string;
   thinkingOptionId?: string;
+  modeId?: string;
   systemPrompt?: string;
 }
 
@@ -132,7 +139,9 @@ interface StartTurnResult {
 }
 
 interface PiRpcAgentSessionOptions {
+  runtime: PiRuntime;
   runtimeSession: PiRuntimeSession;
+  startInput: PiStartSessionInput;
   config: AgentSessionConfig;
   initialState: PiSessionState;
   capabilities: AgentCapabilityFlags;
@@ -239,6 +248,16 @@ function mapThinkingOption(option: (typeof PI_THINKING_OPTIONS)[number]) {
   return mappedOption;
 }
 
+function getFamilyAgentModes(family: PiFamilyConfig): AgentMode[] {
+  return (
+    family.approvalModes?.map((mode) => ({
+      id: mode.id,
+      label: mode.label,
+      description: mode.description,
+    })) ?? []
+  );
+}
+
 function toAgentUsage(stats: PiSessionStats): AgentUsage | undefined {
   const inputTokens = stats.tokens?.input ?? 0;
   const cachedInputTokens = stats.tokens?.cacheRead ?? 0;
@@ -334,6 +353,7 @@ function parsePersistenceMetadata(metadata: AgentMetadata | undefined): PiPersis
     ...(typeof metadata.thinkingOptionId === "string"
       ? { thinkingOptionId: metadata.thinkingOptionId }
       : {}),
+    ...(typeof metadata.modeId === "string" ? { modeId: metadata.modeId } : {}),
     ...(typeof metadata.systemPrompt === "string" ? { systemPrompt: metadata.systemPrompt } : {}),
   };
 }
@@ -347,6 +367,7 @@ function buildResumeConfig(
   const cwd = overrideConfig.cwd ?? metadata.cwd ?? process.cwd();
   const model = overrideConfig.model ?? metadata.model;
   const thinkingOptionId = overrideConfig.thinkingOptionId ?? metadata.thinkingOptionId;
+  const modeId = overrideConfig.modeId ?? metadata.modeId;
   return {
     cwd,
     model,
@@ -357,6 +378,7 @@ function buildResumeConfig(
       cwd,
       model,
       thinkingOptionId,
+      modeId,
       systemPrompt: overrideConfig.systemPrompt ?? metadata.systemPrompt,
     },
   };
@@ -519,6 +541,14 @@ function isPiRequestAbortError(error: unknown): boolean {
   }
 
   return /\brequest was aborted\b|\babort(ed)?\b/i.test(toDiagnosticErrorMessage(error));
+}
+
+function isUnsupportedPiSetApprovalModeError(error: unknown): boolean {
+  const message = toDiagnosticErrorMessage(error);
+  return (
+    /\bUnknown command: set_approval_mode\b/i.test(message) ||
+    /\brequest timed out for set_approval_mode\b/i.test(message)
+  );
 }
 
 function resolveThinkingOptionId(
@@ -756,6 +786,11 @@ export class PiRpcAgentSession implements AgentSession {
   private readonly seenUserEntryIds = new Set<string>();
   private readonly pendingUserMessages: PendingPiUserMessage[] = [];
   private readonly pendingExtensionResults = new Map<string, PendingExtensionResult>();
+  private readonly runtime: PiRuntime;
+  private runtimeSession: PiRuntimeSession;
+  private startInput: PiStartSessionInput;
+  private runtimeUnsubscribe: (() => void) | undefined;
+  private currentModeId: PiApprovalMode | null;
   private state: PiSessionState;
   private closed = false;
 
@@ -763,7 +798,9 @@ export class PiRpcAgentSession implements AgentSession {
     this.family = options.family;
     this.providerId = options.family.providerId;
     this.provider = options.family.providerId;
+    this.runtime = options.runtime;
     this.runtimeSession = options.runtimeSession;
+    this.startInput = options.startInput;
     this.config = options.config;
     this.state = options.initialState;
     this.capabilities = options.capabilities;
@@ -772,13 +809,11 @@ export class PiRpcAgentSession implements AgentSession {
       normalizePiThinkingOption(options.config.thinkingOptionId) ??
       this.state.thinkingLevel ??
       null;
+    this.currentModeId = resolveFamilyApprovalMode(this.family, options.config.modeId);
 
-    this.runtimeSession.onEvent((event) => {
-      this.handleRuntimeEvent(event);
-    });
+    this.attachRuntimeSession(this.runtimeSession);
   }
 
-  private readonly runtimeSession: PiRuntimeSession;
   private readonly config: AgentSessionConfig;
   private readonly cleanup?: () => void;
 
@@ -856,21 +891,34 @@ export class PiRpcAgentSession implements AgentSession {
         this.lastKnownThinkingOptionId,
         this.state.thinkingLevel,
       ),
-      modeId: null,
+      modeId: this.currentModeId,
     };
   }
 
   async getAvailableModes(): Promise<AgentMode[]> {
-    return [];
+    return getFamilyAgentModes(this.family);
   }
 
   async getCurrentMode(): Promise<string | null> {
-    return null;
+    return this.currentModeId;
   }
 
   async setMode(modeId: string): Promise<void> {
-    void modeId;
-    throw new Error("Pi does not expose selectable modes");
+    if (!this.family.approvalModes) {
+      throw new Error(`${this.family.displayLabel} does not expose selectable modes`);
+    }
+    const nextMode = resolveFamilyApprovalMode(this.family, modeId);
+    if (!nextMode) {
+      throw new Error(`${this.family.displayLabel} does not expose selectable modes`);
+    }
+    if (nextMode === this.currentModeId) {
+      return;
+    }
+    if (!(await this.trySetRuntimeApprovalMode(nextMode))) {
+      await this.restartRuntimeSessionWithApprovalMode(nextMode);
+    }
+    this.currentModeId = nextMode;
+    this.config.modeId = nextMode;
   }
 
   getPendingPermissions(): AgentPermissionRequest[] {
@@ -906,6 +954,7 @@ export class PiRpcAgentSession implements AgentSession {
         cwd: this.config.cwd,
         ...(this.config.model ? { model: this.config.model } : {}),
         ...(this.config.thinkingOptionId ? { thinkingOptionId: this.config.thinkingOptionId } : {}),
+        ...(this.currentModeId ? { modeId: this.currentModeId } : {}),
       },
     };
   }
@@ -949,6 +998,8 @@ export class PiRpcAgentSession implements AgentSession {
     }
     this.closed = true;
     try {
+      this.runtimeUnsubscribe?.();
+      this.runtimeUnsubscribe = undefined;
       await this.runtimeSession.close();
     } finally {
       this.rejectAllExtensionResults(new Error("Pi session closed"));
@@ -991,6 +1042,83 @@ export class PiRpcAgentSession implements AgentSession {
       ...this.state,
       thinkingLevel,
     };
+  }
+
+  private attachRuntimeSession(runtimeSession: PiRuntimeSession): void {
+    this.runtimeUnsubscribe = runtimeSession.onEvent((event) => {
+      this.handleRuntimeEvent(event);
+    });
+  }
+
+  private async trySetRuntimeApprovalMode(approvalMode: PiApprovalMode): Promise<boolean> {
+    try {
+      await this.runtimeSession.setApprovalMode(approvalMode);
+      this.startInput = {
+        ...this.startInput,
+        approvalMode,
+      };
+      return true;
+    } catch (error) {
+      if (isUnsupportedPiSetApprovalModeError(error)) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  private async restartRuntimeSessionWithApprovalMode(approvalMode: PiApprovalMode): Promise<void> {
+    if (this.closed) {
+      throw new Error(`${this.family.displayLabel} session is closed`);
+    }
+    if (this.activeTurnId) {
+      throw new Error(`Cannot change ${this.family.displayLabel} mode while a turn is active`);
+    }
+    if (this.pendingExtensionUiRequests.size > 0) {
+      throw new Error(
+        `Cannot change ${this.family.displayLabel} mode while a permission request is pending`,
+      );
+    }
+    if (this.pendingExtensionResults.size > 0) {
+      throw new Error(
+        `Cannot change ${this.family.displayLabel} mode while an extension request is pending`,
+      );
+    }
+
+    await this.refreshState().catch(() => undefined);
+    const sessionFile = this.state.sessionFile;
+    if (!sessionFile) {
+      throw new Error(
+        `Cannot change ${this.family.displayLabel} mode because the native session file is unknown`,
+      );
+    }
+
+    const nextStartInput: PiStartSessionInput = {
+      ...this.startInput,
+      session: sessionFile,
+      approvalMode,
+      thinkingOptionId:
+        normalizePiThinkingOption(this.config.thinkingOptionId) ??
+        normalizePiThinkingOption(this.lastKnownThinkingOptionId) ??
+        this.startInput.thinkingOptionId,
+      model: this.config.model ?? this.startInput.model,
+    };
+    const nextRuntimeSession = await this.runtime.startSession(nextStartInput);
+    let nextState: PiSessionState;
+    try {
+      nextState = await nextRuntimeSession.getState();
+    } catch (error) {
+      await nextRuntimeSession.close().catch(() => undefined);
+      throw error;
+    }
+
+    const previousRuntimeSession = this.runtimeSession;
+    this.runtimeUnsubscribe?.();
+    this.runtimeUnsubscribe = undefined;
+    this.runtimeSession = nextRuntimeSession;
+    this.startInput = nextStartInput;
+    this.state = nextState;
+    this.attachRuntimeSession(nextRuntimeSession);
+    await previousRuntimeSession.close().catch(() => undefined);
   }
 
   private emit(event: AgentStreamEvent): void {
@@ -1352,6 +1480,10 @@ export class PiRpcAgentSession implements AgentSession {
 
   private async refreshState(): Promise<void> {
     this.state = await this.runtimeSession.getState();
+    if (this.family.approvalModes && this.state.approvalMode) {
+      this.currentModeId = this.state.approvalMode;
+      this.config.modeId = this.state.approvalMode;
+    }
   }
 
   private async refreshAfterTurn(turnId: string | undefined): Promise<void> {
@@ -1393,23 +1525,23 @@ export class PiRpcAgentClient implements AgentClient {
     config: AgentSessionConfig,
     launchContext?: AgentLaunchContext,
   ): Promise<AgentSession> {
+    const approvalMode = resolveFamilyApprovalMode(this.family, config.modeId) ?? undefined;
     const mcpConfig = await this.prepareMcpConfig(config.cwd, config.mcpServers);
     const paseoExtension = createPiPaseoExtensionFile();
+    const startInput: PiStartSessionInput = {
+      cwd: config.cwd,
+      model: config.model,
+      thinkingOptionId:
+        normalizePiThinkingOption(config.thinkingOptionId) ?? DEFAULT_PI_THINKING_LEVEL,
+      approvalMode,
+      systemPrompt: composeSystemPromptParts(config.systemPrompt, config.daemonAppendSystemPrompt),
+      env: launchContext?.env,
+      mcpConfigPath: mcpConfig?.path,
+      extensionPaths: [paseoExtension.path],
+    };
     let runtimeSession: PiRuntimeSession;
     try {
-      runtimeSession = await this.runtime.startSession({
-        cwd: config.cwd,
-        model: config.model,
-        thinkingOptionId:
-          normalizePiThinkingOption(config.thinkingOptionId) ?? DEFAULT_PI_THINKING_LEVEL,
-        systemPrompt: composeSystemPromptParts(
-          config.systemPrompt,
-          config.daemonAppendSystemPrompt,
-        ),
-        env: launchContext?.env,
-        mcpConfigPath: mcpConfig?.path,
-        extensionPaths: [paseoExtension.path],
-      });
+      runtimeSession = await this.runtime.startSession(startInput);
     } catch (error) {
       mcpConfig?.cleanup();
       paseoExtension.cleanup();
@@ -1417,7 +1549,9 @@ export class PiRpcAgentClient implements AgentClient {
     }
     try {
       return new PiRpcAgentSession({
+        runtime: this.runtime,
         runtimeSession,
+        startInput,
         config,
         initialState: await runtimeSession.getState(),
         capabilities: withPiMcpCapability(mcpConfig !== null),
@@ -1444,23 +1578,27 @@ export class PiRpcAgentClient implements AgentClient {
 
     const persistenceMetadata = parsePersistenceMetadata(handle.metadata);
     const resumeConfig = buildResumeConfig(persistenceMetadata, overrides, this.family);
+    const approvalMode =
+      resolveFamilyApprovalMode(this.family, resumeConfig.config.modeId) ?? undefined;
 
     const mcpConfig = await this.prepareMcpConfig(resumeConfig.cwd, resumeConfig.config.mcpServers);
     const paseoExtension = createPiPaseoExtensionFile();
+    const startInput: PiStartSessionInput = {
+      cwd: resumeConfig.cwd,
+      session: sessionFile,
+      model: resumeConfig.model,
+      thinkingOptionId: normalizePiThinkingOption(resumeConfig.thinkingOptionId) ?? undefined,
+      approvalMode,
+      systemPrompt: composeSystemPromptParts(
+        resumeConfig.config.systemPrompt,
+        resumeConfig.config.daemonAppendSystemPrompt,
+      ),
+      mcpConfigPath: mcpConfig?.path,
+      extensionPaths: [paseoExtension.path],
+    };
     let runtimeSession: PiRuntimeSession;
     try {
-      runtimeSession = await this.runtime.startSession({
-        cwd: resumeConfig.cwd,
-        session: sessionFile,
-        model: resumeConfig.model,
-        thinkingOptionId: normalizePiThinkingOption(resumeConfig.thinkingOptionId) ?? undefined,
-        systemPrompt: composeSystemPromptParts(
-          resumeConfig.config.systemPrompt,
-          resumeConfig.config.daemonAppendSystemPrompt,
-        ),
-        mcpConfigPath: mcpConfig?.path,
-        extensionPaths: [paseoExtension.path],
-      });
+      runtimeSession = await this.runtime.startSession(startInput);
     } catch (error) {
       mcpConfig?.cleanup();
       paseoExtension.cleanup();
@@ -1468,7 +1606,9 @@ export class PiRpcAgentClient implements AgentClient {
     }
     try {
       return new PiRpcAgentSession({
+        runtime: this.runtime,
         runtimeSession,
+        startInput,
         config: resumeConfig.config,
         initialState: await runtimeSession.getState(),
         capabilities: withPiMcpCapability(mcpConfig !== null),
@@ -1495,7 +1635,7 @@ export class PiRpcAgentClient implements AgentClient {
   }
 
   async listModes(_options: ListModesOptions): Promise<AgentMode[]> {
-    return [];
+    return getFamilyAgentModes(this.family);
   }
 
   async listPersistedAgents(
