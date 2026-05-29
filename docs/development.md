@@ -144,6 +144,17 @@ npm run cli -- logs <id>             # View agent timeline
 npm run cli -- daemon status         # Check daemon status
 ```
 
+Stream a foreground agent task as NDJSON:
+
+```bash
+npm run cli -- agent exec --provider codex "summarize this repo"
+npm run cli -- agent exec --agent <id> "continue with the next step"
+```
+
+`agent exec` prints one JSON object per line: `start`, `event`, then `finish`.
+It exits `0` only when the final status is `completed`; timeout, permission, and
+agent errors exit nonzero after printing the `finish` event.
+
 Use `--host <host:port>` to point the CLI at a different daemon:
 
 ```bash
