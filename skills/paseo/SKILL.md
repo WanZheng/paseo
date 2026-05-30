@@ -100,6 +100,36 @@ paseo worktree ls
 paseo schedule create --every 5m "ping main build"
 ```
 
+### `paseo agent exec`
+
+Use `agent exec` when a coding agent needs a script-friendly way to create or continue an agent and wait for the result. It streams newline-delimited JSON to stdout: `start`, zero or more `event`, then `finish`. Exit code is `0` only when `finish.status === "completed"`; timeout, permission, and agent errors exit nonzero after the `finish` event.
+
+Create a new agent:
+
+```bash
+paseo agent exec --provider codex/gpt-5.4 --mode full-access --title "Fix auth race" "fix the failing auth race"
+```
+
+Continue an existing agent:
+
+```bash
+paseo agent exec --agent <agent-id> "continue with the next step"
+```
+
+For non-trivial prompts, write the prompt to a file and pass `--prompt-file <path>` instead of fighting shell quoting. Exactly one prompt source is allowed: positional prompt, `--prompt <text>`, or `--prompt-file <path>`.
+
+Useful create-only options: `--provider`, `--model`, `--thinking`, `--mode`, `--cwd`, `--worktree`, `--base`, `--env key=value`, `--label key=value`, `--image <path>`, `--timeout <duration>`. With `--agent`, do not pass create-only options; only prompt input, images, timeout, and host selection apply.
+
+Examples for coding agents:
+
+```bash
+# Create in a worktree off main and wait.
+paseo agent exec --provider codex/gpt-5.4 --worktree fix-login --base main --prompt-file /tmp/prompt.txt
+
+# Continue an agent and fail the shell step unless it completes.
+paseo agent exec --agent abc123 --timeout 45m --prompt "run the focused test and report the failure"
+```
+
 Discover with `paseo --help` and `paseo <cmd> --help`.
 
 **If `paseo` isn't on PATH but the desktop app is installed**, the bundled CLI is at:
